@@ -1,0 +1,235 @@
+# ============================================================================
+# preview-deploy.yml — PR previews usando Dokploy + Nixpacks
+# ============================================================================
+# Template CI/CD — substitua os PLACEHOLDERS antes de usar
+#
+# PLACEHOLDERS a substituir:
+#   PROJECT_NAME   → nome do projeto (ex: meu-app)
+#   REPO_OWNER     → owner do GitHub (ex: MinhaOrg)
+#   REPO_NAME      → nome do repo (ex: meu-app)
+#   BUILD_PATH     → path relativo ao root do repo (ex: /apps/web/)
+#   DEFAULT_PORT   → porta do app (ex: 3000, 8000, 8080)
+#   MEMORY_LIMIT   → limite de memoria em MB (ex: 512)
+#   MEMORY_RESERVATION → memoria reservada em MB (ex: 128)
+# ============================================================================
+
+name: Preview Deploy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Numero da PR (deploy manual)'
+        required: true
+
+concurrency:
+  group: preview-deploy-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  DOKPLOY_URL: https://dokploy.easytron.com.br
+  DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+  DOKPLOY_PROJECT_ID: ${{ secrets.DOKPLOY_PROJECT_ID }}
+  DOKPLOY_ENV_ID: ${{ secrets.DOKPLOY_ENV_ID }}
+  DOKPLOY_GITHUB_ID: ${{ secrets.DOKPLOY_GITHUB_ID }}
+
+jobs:
+  deploy-preview:
+    name: Deploy PR Preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Set PR context
+        id: vars
+        run: |
+          if [[ -n "${{ github.event.pull_request.number }}" ]]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            BRANCH="${{ github.event.pull_request.head.ref }}"
+          else
+            PR_NUMBER="${{ github.event.inputs.pr_number }}"
+            BRANCH=$(curl -sf -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+              | jq -r .head.ref)
+          fi
+          APP_NAME="pr-${PR_NUMBER}"
+          DOMAIN="${APP_NAME}.dokploy.easytron.com.br"
+          echo "PR_NUMBER=${PR_NUMBER}" >> $GITHUB_OUTPUT
+          echo "BRANCH=${BRANCH}" >> $GITHUB_OUTPUT
+          echo "APP_NAME=${APP_NAME}" >> $GITHUB_OUTPUT
+          echo "DOMAIN=${DOMAIN}" >> $GITHUB_OUTPUT
+
+      - name: Build request bodies
+        id: bodies
+        run: |
+          cat > /tmp/project_input.json <<EOF
+          {"json":{"projectId":"${DOKPLOY_PROJECT_ID}"}}
+          EOF
+          cat > /tmp/update_body.json <<EOF
+          {"json":{"applicationId":"PLACEHOLDER","sourceType":"github","owner":"REPO_OWNER","repository":"REPO_NAME","branch":"BRANCH_PLACEHOLDER","buildType":"nixpacks","buildPath":"BUILD_PATH","memoryLimit":"MEMORY_LIMIT","memoryReservation":"MEMORY_RESERVATION","port":DEFAULT_PORT,"autodeploy":false}}
+          EOF
+          cat > /tmp/domain_body.json <<EOF
+          {"json":{"applicationId":"PLACEHOLDER","host":"DOMAIN_PLACEHOLDER","port":DEFAULT_PORT}}
+          EOF
+          echo "bodies_built=true" >> $GITHUB_OUTPUT
+
+      - name: Find or create preview app
+        id: app
+        env:
+          INPUT_FILE: /tmp/project_input.json
+          PR_NUMBER: ${{ steps.vars.outputs.PR_NUMBER }}
+          BRANCH: ${{ steps.vars.outputs.BRANCH }}
+        run: |
+          set +e
+          RESPONSE=$(curl -s -G \
+            -H "x-api-key: ${DOKPLOY_API_KEY}" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+            -H "Accept: application/json" \
+            --data-urlencode "input@${INPUT_FILE}" \
+            "${DOKPLOY_URL}/api/trpc/project.one")
+          CURL_EXIT=$?
+          echo "curl exit: ${CURL_EXIT}"
+          echo "Response: ${RESPONSE}" | head -c 500
+          echo ""
+
+          if [[ ${CURL_EXIT} -ne 0 ]]; then
+            echo "ERRO: curl falhou"
+            exit 1
+          fi
+
+          APP_ID=$(echo "${RESPONSE}" | jq -r --arg name "pr-${PR_NUMBER}" \
+            '.result.data.json.environments[].applications[]? | select(.name==$name) | .applicationId' | head -1)
+
+          if [[ -z "${APP_ID}" || "${APP_ID}" == "null" ]]; then
+            echo "App nao existe, criando..."
+            CREATE_BODY=$(jq -nc \
+              --arg name "pr-${PR_NUMBER}" \
+              --arg eid "${DOKPLOY_ENV_ID}" \
+              --arg desc "Preview PR #${PR_NUMBER} (${BRANCH})" \
+              '{json:{name:$name, environmentId:$eid, description:$desc}}')
+            CREATE_RESPONSE=$(curl -s -X POST \
+              -H "x-api-key: ${DOKPLOY_API_KEY}" \
+              -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+              -H "Content-Type: application/json" \
+              -d "${CREATE_BODY}" \
+              "${DOKPLOY_URL}/api/trpc/application.create")
+            echo "Create response: ${CREATE_RESPONSE}" | head -c 500
+            echo ""
+            APP_ID=$(echo "${CREATE_RESPONSE}" | jq -r '.result.data.json.applicationId')
+          fi
+
+          if [[ -z "${APP_ID}" || "${APP_ID}" == "null" ]]; then
+            echo "ERRO: nao conseguiu obter/criar app"
+            exit 1
+          fi
+          echo "app_id=${APP_ID}" >> $GITHUB_OUTPUT
+
+      - name: Configure GitHub Provider
+        env:
+          APP_ID: ${{ steps.app.outputs.app_id }}
+        run: |
+          curl -s -X POST \
+            -H "x-api-key: ${DOKPLOY_API_KEY}" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -nc --arg aid "${APP_ID}" --arg gid "${DOKPLOY_GITHUB_ID}" \
+              '{json:{applicationId:$aid, sourceType:"github", githubId:$gid}}')" \
+            "${DOKPLOY_URL}/api/trpc/application.update" \
+            && echo "Provider linked" \
+            || echo "Provider linking failed (continuing)"
+
+      - name: Configure app (Nixpacks git source)
+        env:
+          APP_ID: ${{ steps.app.outputs.app_id }}
+          BRANCH: ${{ steps.vars.outputs.BRANCH }}
+        run: |
+          BODY=$(jq -nc \
+            --arg aid "${APP_ID}" \
+            --arg branch "${BRANCH}" \
+            '{json:{applicationId:$aid, owner:"REPO_OWNER", repository:"REPO_NAME", branch:$branch, buildType:"nixpacks", buildPath:"BUILD_PATH", memoryLimit:"MEMORY_LIMIT", memoryReservation:"MEMORY_RESERVATION", port:DEFAULT_PORT, autodeploy:false}}')
+
+          RESP=$(curl -s -X POST \
+            -H "x-api-key: ${DOKPLOY_API_KEY}" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+            -H "Content-Type: application/json" \
+            -d "${BODY}" \
+            "${DOKPLOY_URL}/api/trpc/application.update")
+
+          echo "  response: ${RESP}"
+
+      - name: Configure environment variables
+        env:
+          APP_ID: ${{ steps.app.outputs.app_id }}
+        run: |
+          ENV_LINES=()
+          while IFS= read -r line; do
+            [[ -n "$line" ]] && ENV_LINES+=("$line")
+          done < <(env | grep -E '^CONSTANTINE_' | while IFS='=' read -r var_name var_value; do
+            clean_name="${var_name#CONSTANTINE_}"
+            echo "${clean_name}=${var_value}"
+            echo "  + ${clean_name}" >&2
+          done)
+          ENV_STR=""
+          if [[ ${#ENV_LINES[@]} -gt 0 ]]; then
+            OLD_IFS="$IFS"
+            IFS=$'\n'
+            ENV_STR="${ENV_LINES[*]}"
+            IFS="$OLD_IFS"
+          fi
+
+          if [[ -z "$ENV_STR" ]]; then
+            echo "AVISO: Nenhum CONSTANTINE_* secret setado (vai rodar sem envs)"
+            exit 0
+          fi
+
+          curl -sf -X POST \
+            -H "x-api-key: ${DOKPLOY_API_KEY}" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -nc --arg aid "$APP_ID" --arg e "$ENV_STR" \
+              '{json:{applicationId:$aid, env:$e}}')" \
+            "${DOKPLOY_URL}/api/trpc/application.update" \
+            && echo "OK envs configuradas" \
+            || echo "FAIL ao configurar envs (continua sem envs)"
+
+      - name: Add domain
+        env:
+          APP_ID: ${{ steps.app.outputs.app_id }}
+          DOMAIN: ${{ steps.vars.outputs.DOMAIN }}
+        run: |
+          BODY=$(jq -nc \
+            --arg aid "${APP_ID}" \
+            --arg host "${DOMAIN}" \
+            '{json:{applicationId:$aid, host:$host, port:DEFAULT_PORT}}')
+          curl -s -X POST \
+            -H "x-api-key: ${DOKPLOY_API_KEY}" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+            -H "Content-Type: application/json" \
+            -d "${BODY}" \
+            "${DOKPLOY_URL}/api/trpc/domain.create" \
+            || echo "Domain may already exist (ok on redeploy)"
+
+      - name: Deploy
+        env:
+          APP_ID: ${{ steps.app.outputs.app_id }}
+        run: |
+          BODY=$(jq -nc --arg aid "${APP_ID}" '{json:{applicationId:$aid}}')
+          curl -s -X POST \
+            -H "x-api-key: ${DOKPLOY_API_KEY}" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+            -H "Content-Type: application/json" \
+            -d "${BODY}" \
+            "${DOKPLOY_URL}/api/trpc/application.deploy"
+
+      - name: Print preview URL (visible in Action logs)
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "  PREVIEW DEPLOYED!"
+          echo "  URL: https://${{ steps.vars.outputs.DOMAIN }}"
+          echo "  BRANCH: ${{ steps.vars.outputs.BRANCH }}"
+          echo "  BUILD: Nixpacks (no Docker build needed)"
+          echo "=========================================="

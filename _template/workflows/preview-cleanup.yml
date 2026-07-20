@@ -1,0 +1,63 @@
+# ============================================================================
+# preview-cleanup.yml — Cleanup quando PR e fechada/mergeada
+# ============================================================================
+# Template CI/CD — substitua os PLACEHOLDERS antes de usar
+# ============================================================================
+
+name: Preview Cleanup
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [develop]
+
+concurrency:
+  group: preview-cleanup-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  DOKPLOY_URL: https://dokploy.easytron.com.br
+  DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+  DOKPLOY_PROJECT_ID: ${{ secrets.DOKPLOY_PROJECT_ID }}
+  DOKPLOY_ENV_ID: ${{ secrets.DOKPLOY_ENV_ID }}
+
+jobs:
+  cleanup:
+    name: Remove preview app
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Delete preview app
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          APP_NAME="pr-${PR_NUMBER}"
+          echo "Cleaning up preview app: ${APP_NAME}"
+
+          INPUT=$(jq -nc --arg pid "${DOKPLOY_PROJECT_ID}" '{json:{projectId:$pid}}')
+          RESPONSE=$(curl -sf -G \
+            -H "x-api-key: ${DOKP...Y}" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+            -H "Accept: application/json" \
+            --data-urlencode "input=${INPUT}" \
+            "${DOKPLOY_URL}/api/trpc/project.one")
+
+          APP_ID=$(echo "${RESPONSE}" | jq -r --arg name "${APP_NAME}" \
+            '.result.data.json.environments[].applications[]? | select(.name==$name) | .applicationId' | head -1)
+
+          if [[ -z "${APP_ID}" || "${APP_ID}" == "null" ]]; then
+            echo "App ${APP_NAME} nao existe, nada a fazer"
+            exit 0
+          fi
+
+          echo "Deleting app ${APP_NAME} (${APP_ID})..."
+          DELETE_BODY=$(jq -nc --arg aid "${APP_ID}" '{json:{applicationId:$aid}}')
+          curl -sf -X POST \
+            -H "x-api-key: ${DOKP...Y}" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+            -H "Content-Type: application/json" \
+            -d "${DELETE_BODY}" \
+            "${DOKPLOY_URL}/api/trpc/application.delete" \
+            && echo "App deletado" \
+            || echo "FAIL ao deletar (continua)"
